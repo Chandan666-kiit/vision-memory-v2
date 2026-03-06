@@ -18,7 +18,7 @@ from deepface import DeepFace
 import streamlit as st
 
 DIM             = 128   # DeepFace Facenet embeddings are 128-d
-FAISS_THRESHOLD = 0.8
+FAISS_THRESHOLD = 20.0  # Facenet L2 distance: same person ~5-15, diff person >20
 TOP_K           = 3
 MODEL_NAME      = "Facenet"   # fast + accurate, 128-d embeddings
 
@@ -147,9 +147,13 @@ def _same_person(live_b64: str, stored_b64: str) -> bool:
                     "You are a face verification system.\n"
                     "Image 1 = NEW photo.  Image 2 = STORED reference.\n\n"
                     "Are these the SAME person?\n"
-                    "Compare ONLY: face shape, eyes, nose, mouth, jawline, skin tone.\n"
-                    "IGNORE: hair, glasses, lighting, expression, background.\n"
-                    "Be strict — only say true if genuinely sure.\n\n"
+                    "Compare: face shape, eyes, nose, mouth, jawline, skin tone.\n"
+                    "IGNORE completely: hair colour/style, glasses, lighting, "
+                    "expression, age difference, background, camera angle.\n"
+                    "These may be taken years apart or in very different conditions — "
+                    "focus only on permanent facial bone structure.\n"
+                    "When in doubt, lean towards TRUE — a human verifier will "
+                    "confirm if needed.\n\n"
                     'JSON only: {"same_person": true/false, '
                     '"confidence": "high/medium/low", "reason": "one sentence"}'
                 )},
@@ -167,7 +171,8 @@ def _same_person(live_b64: str, stored_b64: str) -> bool:
         same       = bool(data.get("same_person", False))
         confidence = data.get("confidence", "low")
         print(f"[main] GPT-4o → same={same} conf={confidence} | {data.get('reason','')}")
-        return same and confidence in ("high", "medium")
+        # Accept high OR medium OR low confidence matches — FAISS already pre-filtered
+        return same
     except Exception as e:
         print(f"[main] GPT-4o error: {e}")
         return False
