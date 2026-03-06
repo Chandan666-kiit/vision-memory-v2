@@ -4,5 +4,6 @@ pymongo
 faiss-cpu
 numpy
 Pillow
-dlib
-face-recognition
+deepface
+tf-keras
+opencv-python-headless

@@ -1,24 +1,26 @@
 """
 main.py  —  Vision & Memory Pipeline
-No bson/ObjectId imports — MongoDB docs are queried by a plain string 'doc_id' field.
+Uses DeepFace (no C++ compilation) instead of face_recognition/dlib.
 """
 import base64
 import io
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 
-import face_recognition
 import numpy as np
 import faiss
 from PIL import Image
 from pymongo import MongoClient
 from openai import OpenAI
+from deepface import DeepFace
 import streamlit as st
 
-DIM             = 128
-FAISS_THRESHOLD = 2.5
+DIM             = 128   # DeepFace Facenet embeddings are 128-d
+FAISS_THRESHOLD = 0.8
 TOP_K           = 3
+MODEL_NAME      = "Facenet"   # fast + accurate, 128-d embeddings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +28,7 @@ TOP_K           = 3
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def _openai() -> OpenAI:
+def _openai():
     return OpenAI()
 
 
@@ -43,56 +45,87 @@ def _get_col():
 @st.cache_resource
 def _get_faiss() -> dict:
     col = _get_col()
-
-    # Clean corrupt docs from old runs
-    bad = col.delete_many({
-        "$or": [
-            {"name": {"$in": ["", "unknown", None]}},
-            {"embedding": {"$exists": False}},
-            {"embedding": []},
-        ]
-    })
-    if bad.deleted_count:
-        print(f"[main] Cleaned {bad.deleted_count} corrupt doc(s).")
-
+    col.delete_many({"$or": [
+        {"name": {"$in": ["", "unknown", None]}},
+        {"embedding": {"$exists": False}},
+        {"embedding": []},
+    ]})
     index = faiss.IndexFlatL2(DIM)
-    ids: list[str] = []   # parallel list: faiss row → doc_id string
-
-    for doc in col.find(
-        {"embedding": {"$exists": True},
-         "name":      {"$nin": ["", None, "unknown"]}}
-    ):
+    ids: list[str] = []
+    for doc in col.find({"embedding": {"$exists": True},
+                         "name": {"$nin": ["", None, "unknown"]}}):
         vec = np.array(doc["embedding"], dtype="float32")
-        index.add(vec.reshape(1, -1))
-        # Use our own string 'doc_id' field; fall back to str(_id)
-        ids.append(doc.get("doc_id") or str(doc["_id"]))
-
+        if len(vec) == DIM:
+            index.add(vec.reshape(1, -1))
+            ids.append(doc.get("doc_id") or str(doc["_id"]))
     print(f"[main] FAISS ready — {index.ntotal} profile(s).")
     return {"index": index, "ids": ids}
 
 
 def get_people_col():
-    """Exported for Streamlit sidebar."""
     return _get_col()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMBEDDING  (DeepFace Facenet — no dlib, no compilation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_embedding(image_path: str) -> tuple[list, str]:
+    """
+    Returns (embedding, face_b64) or ([], '') if no face found.
+    face_b64 is the cropped face as base64 JPEG for GPT-4o comparison.
+    """
+    try:
+        result = DeepFace.represent(
+            img_path    = image_path,
+            model_name  = MODEL_NAME,
+            enforce_detection = True,
+            detector_backend  = "opencv",
+        )
+        if not result:
+            return [], ""
+
+        embedding  = result[0]["embedding"]           # 128-d list
+        facial_area = result[0].get("facial_area", {})
+
+        # Crop the face region for GPT-4o
+        face_b64 = _crop_face(image_path, facial_area)
+        return embedding, face_b64
+
+    except Exception as e:
+        print(f"[main] DeepFace error: {e}")
+        return [], ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMAGE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _crop_face(image_path: str, location: tuple) -> str:
-    img = Image.open(image_path).convert("RGB")
-    top, right, bottom, left = location
-    pad_y = int((bottom - top)  * 0.25)
-    pad_x = int((right  - left) * 0.25)
-    top    = max(0,          top    - pad_y)
-    left   = max(0,          left   - pad_x)
-    bottom = min(img.height, bottom + pad_y)
-    right  = min(img.width,  right  + pad_x)
-    face   = img.crop((left, top, right, bottom)).resize((224, 224))
-    buf    = io.BytesIO()
-    face.save(buf, format="JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode()
+def _crop_face(image_path: str, area: dict) -> str:
+    """Crop face from image using DeepFace facial_area dict."""
+    try:
+        img = Image.open(image_path).convert("RGB")
+        x = area.get("x", 0)
+        y = area.get("y", 0)
+        w = area.get("w", img.width)
+        h = area.get("h", img.height)
+        pad_x = int(w * 0.25)
+        pad_y = int(h * 0.25)
+        left   = max(0, x - pad_x)
+        top    = max(0, y - pad_y)
+        right  = min(img.width,  x + w + pad_x)
+        bottom = min(img.height, y + h + pad_y)
+        face   = img.crop((left, top, right, bottom)).resize((224, 224))
+        buf    = io.BytesIO()
+        face.save(buf, format="JPEG", quality=90)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print(f"[main] crop error: {e}")
+        # Fall back to full image resized
+        img  = Image.open(image_path).convert("RGB").resize((224, 224))
+        buf  = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return base64.b64encode(buf.getvalue()).decode()
 
 
 def _full_b64(image_path: str) -> str:
@@ -141,7 +174,7 @@ def _same_person(live_b64: str, stored_b64: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ATTRIBUTE DETECTION
+# ATTRIBUTE DETECTION  (GPT-4o-mini)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _vj(img_b64: str, prompt: str) -> dict:
@@ -149,30 +182,22 @@ def _vj(img_b64: str, prompt: str) -> dict:
         res = _openai().chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": [
-                {"type": "text",
-                 "text": prompt + "\nJSON only. No markdown."},
+                {"type": "text",  "text": prompt + "\nJSON only. No markdown."},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
             ]}],
             response_format={"type": "json_object"},
         )
         return json.loads(res.choices[0].message.content)
-    except Exception as e:
-        print(f"[main] attr error: {e}")
+    except:
         return {}
 
 
 def _detect_attrs(img_b64: str) -> dict:
     return {
-        "glasses":      bool(_vj(img_b64,
-            '{"glasses": true/false} — is person wearing glasses?'
-            ).get("glasses", False)),
-        "emotion":      _vj(img_b64,
-            '{"emotion": "..."} — primary emotion on face?'
-            ).get("emotion", "neutral"),
-        "age_estimate": _vj(img_b64,
-            '{"age_estimate": "25-30"} — estimated age range?'
-            ).get("age_estimate", "unknown"),
+        "glasses":      bool(_vj(img_b64, '{"glasses": true/false} wearing glasses?').get("glasses", False)),
+        "emotion":      _vj(img_b64, '{"emotion": "..."} primary emotion?').get("emotion", "neutral"),
+        "age_estimate": _vj(img_b64, '{"age_estimate": "25-30"} age range?').get("age_estimate", "unknown"),
     }
 
 
@@ -181,7 +206,6 @@ def _detect_attrs(img_b64: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _recognise(embedding: list, live_face_b64: str) -> tuple[str, str]:
-    """FAISS pre-filter → GPT-4o visual confirmation. Returns (name, doc_id)."""
     state = _get_faiss()
     index = state["index"]
     ids   = state["ids"]
@@ -196,39 +220,31 @@ def _recognise(embedding: list, live_face_b64: str) -> tuple[str, str]:
 
     candidates = []
     for dist, pos in zip(D[0].tolist(), I[0].tolist()):
-        dist = float(dist)
-        pos  = int(pos)
+        dist, pos = float(dist), int(pos)
         if dist <= FAISS_THRESHOLD and pos < len(ids):
             candidates.append((dist, ids[pos]))
             print(f"[main] FAISS candidate dist={dist:.4f}")
 
     if not candidates:
-        print("[main] No candidates — unknown person.")
+        print("[main] No FAISS candidates — unknown person.")
         return "", ""
 
     candidates.sort(key=lambda x: x[0])
 
     for dist, doc_id in candidates:
-        # Query by our plain string doc_id field — no ObjectId needed
         doc = _get_col().find_one({"doc_id": doc_id})
         if not doc:
             continue
-
         stored_name = (doc.get("name") or "").strip()
         stored_face = doc.get("face_b64", "")
-
         if not stored_name or not stored_face:
-            print(f"[main] Skipping doc_id={doc_id} — missing name or face.")
             continue
-
-        # GOLDEN RULE: GPT-4o compares both face images
         if _same_person(live_face_b64, stored_face):
             print(f"[main] ✅ Confirmed: '{stored_name}'")
             return stored_name, doc_id
+        print(f"[main] ❌ Rejected: '{stored_name}'")
 
-        print(f"[main] ❌ GPT-4o rejected '{stored_name}'")
-
-    print("[main] All candidates rejected — unknown person.")
+    print("[main] All candidates rejected — unknown.")
     return "", ""
 
 
@@ -244,9 +260,7 @@ def _greeting(name: str, emotion: str, age: str, glasses: bool, is_new: bool) ->
         parts.append(f"You appear to be around {age} years old.")
     if glasses:
         parts.append("I see you're wearing glasses.")
-    parts.append(
-        "Nice to meet you — I'll remember you! ✨" if is_new else "Welcome back! 🎉"
-    )
+    parts.append("Nice to meet you — I'll remember you! ✨" if is_new else "Welcome back! 🎉")
     return " ".join(parts)
 
 
@@ -261,18 +275,16 @@ def analyse_image(image_path: str) -> dict:
         "need_name": False, "person_name": "", "greeting_message": "",
     }
 
-    image     = face_recognition.load_image_file(image_path)
-    locations = face_recognition.face_locations(image, model="hog")
-    encodings = face_recognition.face_encodings(image, locations)
+    embedding, face_b64 = _get_embedding(image_path)
 
-    if not encodings:
+    if not embedding:
         out["greeting_message"] = "No face detected in the image."
         print("[main] No face found.")
         return out
 
     out["person"]    = True
-    out["embedding"] = encodings[0].tolist()
-    out["face_b64"]  = _crop_face(image_path, locations[0])
+    out["embedding"] = embedding
+    out["face_b64"]  = face_b64
     print(f"[main] Face found. FAISS has {_get_faiss()['index'].ntotal} profile(s).")
 
     out.update(_detect_attrs(_full_b64(image_path)))
@@ -283,7 +295,6 @@ def analyse_image(image_path: str) -> dict:
         out["need_name"] = True
         return out
 
-    # Update last_seen — query by doc_id string, no ObjectId
     _get_col().update_one(
         {"doc_id": doc_id},
         {"$set": {"emotion": out["emotion"],
@@ -303,11 +314,9 @@ def register_and_greet(
     if not name or name.lower() == "unknown":
         return {"error": "Please enter a valid name."}
 
-    import uuid
-    doc_id = str(uuid.uuid4())   # plain string ID — no bson needed
-
+    doc_id = str(uuid.uuid4())
     doc = {
-        "doc_id":     doc_id,    # our queryable string key
+        "doc_id":     doc_id,
         "name":       name,
         "embedding":  embedding,
         "face_b64":   face_b64,
@@ -324,8 +333,7 @@ def register_and_greet(
     state["index"].add(vec)
     state["ids"].append(doc_id)
 
-    print(f"[main] ✅ Saved '{name}' doc_id={doc_id} "
-          f"FAISS total={state['index'].ntotal}")
+    print(f"[main] ✅ Saved '{name}' FAISS total={state['index'].ntotal}")
 
     return {
         "person": True, "need_name": False,

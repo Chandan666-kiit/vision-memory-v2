@@ -1,5 +1,2 @@
-build-essential
-cmake
-libopenblas-dev
-liblapack-dev
-libx11-dev
+libgl1
+libglib2.0-0
