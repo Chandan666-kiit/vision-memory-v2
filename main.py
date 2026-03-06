@@ -226,12 +226,12 @@ def _recognise(embedding: list, live_face_b64: str) -> tuple[str, str]:
     candidates = []
     for dist, pos in zip(D[0].tolist(), I[0].tolist()):
         dist, pos = float(dist), int(pos)
-        if dist <= FAISS_THRESHOLD and pos < len(ids):
+        if pos < len(ids):
             candidates.append((dist, ids[pos]))
-            print(f"[main] FAISS candidate dist={dist:.4f}")
+            print(f"[main] FAISS candidate dist={dist:.4f} id={ids[pos]}")
 
     if not candidates:
-        print("[main] No FAISS candidates — unknown person.")
+        print("[main] No FAISS candidates.")
         return "", ""
 
     candidates.sort(key=lambda x: x[0])
